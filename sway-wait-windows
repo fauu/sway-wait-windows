@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+
+import argparse
+from dataclasses import dataclass
+import re
+import signal
+import sys
+from typing import Any, Callable, TypeAlias
+
+from i3ipc import Connection as I3Connection, WindowEvent
+
+
+RULE_COMMENT_PREFIX = "#"
+DIRECTIVE_NAME_PREFIX = ":"
+DIRECTIVES = {
+    "app": "app",
+    "title": "title",
+}
+
+
+@dataclass(frozen=True)
+class ConInfo:
+    id: int
+    name: str
+    app_id: str | None
+    instance: str | None
+
+
+@dataclass(frozen=True)
+class Rule:
+    app: re.Pattern | None
+    title: re.Pattern | None
+    cmd: str
+
+    def matches_app(self, con_info: ConInfo) -> bool:
+        return any(
+            p and self.app and self.app.search(p)
+            for p in (con_info.app_id, con_info.instance)
+        )
+
+    def matches_title(self, title: str) -> bool:
+        return bool(self.title and self.title.search(title))
+
+    def execute(self, i3: I3Connection, con_info: ConInfo) -> None:
+        i3.command(f"[con_id={con_info.id}] {self.cmd}")
+
+
+pending_rules: list[Rule] = []
+
+
+I3EventHandler: TypeAlias = Callable[[I3Connection, Any], None]
+I3EventRuleMatchFn: TypeAlias = Callable[[Rule, ConInfo], bool]
+
+
+def parse_rules(raw: str) -> list[Rule]:
+    rules = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith(RULE_COMMENT_PREFIX):
+            continue
+
+        segs = line.split()
+        curr_directive_name = None
+        curr_directive_vals = {key: None for key in DIRECTIVES}
+        cmd_segs = []
+        for seg in segs:
+            if curr_directive_name:
+                curr_directive_vals[curr_directive_name] = re.compile(seg)
+                curr_directive_name = None
+            elif seg.startswith(DIRECTIVE_NAME_PREFIX):
+                curr_directive_name = seg[len(DIRECTIVE_NAME_PREFIX):]
+                if curr_directive_name not in DIRECTIVES:
+                    raise ValueError(f"Invalid directive: {seg}")
+            else:
+                cmd_segs.append(seg)
+        rules.append(Rule(**curr_directive_vals, cmd=" ".join(cmd_segs)))
+    return rules
+
+
+def get_con_info(e: WindowEvent) -> ConInfo:
+    con = e.ipc_data["container"]
+    return ConInfo(
+        id=con["id"],
+        name=con["name"],
+        app_id=con["app_id"],
+        instance=con.get("window_properties", {}).get("instance"),
+    )
+
+
+def process_rules(i3: I3Connection, e, match_fn: I3EventRuleMatchFn) -> None:
+    global pending_rules
+    con_info = get_con_info(e)
+
+    remaining_rules = []
+    for rule in pending_rules:
+        if match_fn(rule, con_info):
+            rule.execute(i3, con_info)
+        else:
+            remaining_rules.append(rule)
+    pending_rules = remaining_rules
+
+    if not pending_rules:
+        sys.exit(0)
+
+
+def handle_sigalrm(_signum, _frame):
+    sys.exit(1)
+
+
+I3_EVENT_RULE_MATCHERS: dict[str, I3EventRuleMatchFn] = {
+    "window::new": lambda rule, con_info: \
+        bool(not rule.title and rule.app and rule.matches_app(con_info)),
+    "window::title": lambda rule, con_info: \
+        bool((rule.title and rule.matches_title(con_info.name)) \
+            and (not rule.app or rule.matches_app(con_info))),
+}
+
+
+def main():
+    argparser = argparse.ArgumentParser(
+        prog="sway-wait-windows",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""
+Wait for sway windows to appear and run commands for them. Terminate after all
+provided rules have been applied or after 'timeout' (default = 30). Window rules
+are accepted through the standard input.
+        """,
+        epilog="""e.g.
+
+  echo ':app org.gnome.Calculator  floating enable
+        :title gedit$              move workspace 3, fullscreen enable' \\
+    | ./sway-wait-windows &
+  gnome-calculator &
+  gedit &
+
+The directive ':app org.gnome.Calculator' matches a window with either 'app_id'
+or window 'instance' containing 'org.gnome.Calculator'.
+The directive ':title gedit$' matches a window with a title ending with 'gedit'.
+The directives can be combined to require a match for both 'app_id'/'instance'
+and 'title'.
+""")
+    argparser.add_argument(
+        "--timeout",
+        type=int,
+        default=30,
+        help="always terminate after TIMEOUT (30) seconds",
+    )
+    args = argparser.parse_args()
+
+    if args.timeout > 0:
+        signal.signal(signal.SIGALRM, handle_sigalrm)
+        signal.alarm(args.timeout)
+
+    global pending_rules
+    pending_rules = parse_rules(sys.stdin.read())
+
+    i3 = I3Connection()
+    for event, match_fn in I3_EVENT_RULE_MATCHERS.items():
+        handler: I3EventHandler = \
+            lambda i3, e, match_fn=match_fn: process_rules(i3, e, match_fn)
+        i3.on(event, handler)
+    i3.main()
+
+if __name__ == "__main__":
+    main()
